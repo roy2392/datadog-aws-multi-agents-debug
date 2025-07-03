@@ -6,6 +6,7 @@ import json
 import re
 import uuid
 import dotenv
+from collections import defaultdict
 
 # CRITICAL: Set environment variables BEFORE importing ddtrace to disable APM
 # Load .env if present
@@ -42,471 +43,493 @@ print("✅ LLM Observability enabled for complete agent tracing")
 # Initialize Bedrock client
 client = boto3.client("bedrock-agent-runtime", region_name=BEDROCK_REGION)
 
-def detect_response_type(content):
-    """Detect the type of response (SQL, API, text, etc.)"""
-    content_lower = content.lower().strip()
-    
-    if not content:
-        return "empty_response"
-    
-    # SQL Detection
-    sql_keywords = ['select', 'insert', 'update', 'delete', 'create', 'alter', 'drop', 'from', 'where', 'join']
-    if any(keyword in content_lower for keyword in sql_keywords) and ('from' in content_lower or 'select' in content_lower):
-        return "sql_query"
-    
-    # API/JSON Detection
-    if content.strip().startswith('{') and content.strip().endswith('}'):
+def safe_print(text):
+    """Print text safely, avoiding encoding issues."""
+    try:
+        print(text)
+    except (UnicodeEncodeError, ValueError):
         try:
-            json.loads(content)
-            return "json_response"
+            print(text.encode('ascii', 'ignore').decode('ascii'))
         except:
-            pass
-    
-    # XML Detection
-    if content.strip().startswith('<') and content.strip().endswith('>'):
-        return "xml_response"
-    
-    # URL/API Call Detection
-    if re.search(r'https?://|api\.|/api/|endpoint', content_lower):
-        return "api_call"
-    
-    # Code Detection
-    code_patterns = ['def ', 'function ', 'class ', 'import ', 'return ', '#!/']
-    if any(pattern in content_lower for pattern in code_patterns):
-        return "code_response"
-    
-    # Error Detection
-    error_patterns = ['error:', 'exception:', 'failed:', 'cannot', 'unable to']
-    if any(pattern in content_lower for pattern in error_patterns):
-        return "error_response"
-    
-    # Number/Calculation Detection
-    if re.search(r'^\s*\d+\.?\d*\s*$', content.strip()) or 'count:' in content_lower or 'total:' in content_lower:
-        return "numeric_response"
-    
-    # List Detection
-    if content.count('\n') > 2 and ('1.' in content or '•' in content or '-' in content):
-        return "list_response"
-    
-    return "text_response"
+            print("Processing item...")
 
-def extract_agent_info_from_trace(trace_event):
-    """Extract detailed agent information from any trace event"""
-    agents_found = []
-    trace_data = trace_event.get("trace", {})
+def extract_chunks_from_trace(trace_events):
+    """Extract chunks from trace events based on the AWS documentation structure."""
+    chunks_text = ""
     
-    # Get basic trace info
-    trace_id = trace_event.get("traceId", str(uuid.uuid4()))
-    agent_id = trace_event.get("agentId", "unknown")
-    session_id = trace_event.get("sessionId", "unknown")
-    
-    if "orchestrationTrace" in trace_data:
-        orchestration = trace_data["orchestrationTrace"]
+    try:
+        for trace_event in trace_events:
+            if 'trace' in trace_event:
+                trace = trace_event['trace']
+                
+                # Look for orchestrationTrace
+                if 'orchestrationTrace' in trace:
+                    orchestration = trace['orchestrationTrace']
+                    
+                    # Look for observation with actionGroupInvocationOutput
+                    if 'observation' in orchestration:
+                        observation = orchestration['observation']
+                        
+                        if 'actionGroupInvocationOutput' in observation:
+                            action_output = observation['actionGroupInvocationOutput']
+                            if 'text' in action_output:
+                                chunks_text = action_output['text']
+                                # Remove quotes if it's a JSON string
+                                if chunks_text.startswith('"') and chunks_text.endswith('"'):
+                                    try:
+                                        chunks_text = json.loads(chunks_text)
+                                    except:
+                                        pass
+                        
+                        # Also look for knowledgeBaseLookupOutput
+                        elif 'knowledgeBaseLookupOutput' in observation:
+                            kb_output = observation['knowledgeBaseLookupOutput']
+                            if 'retrievedReferences' in kb_output:
+                                references = kb_output['retrievedReferences']
+                                reference_texts = []
+                                for ref in references:
+                                    if 'content' in ref and 'text' in ref['content']:
+                                        reference_texts.append(ref['content']['text'])
+                                chunks_text = '\n\n'.join(reference_texts)
         
-        # Extract from rationale
-        if "rationale" in orchestration:
-            rationale = orchestration["rationale"]
-            rationale_text = rationale.get("text", "")
-            
-            agent_info = {
-                "type": "reasoning",
-                "agent_id": f"supervisor-reasoning-{trace_id[:8]}",
-                "agent_name": "Supervisor Reasoning",
-                "content": rationale_text,
-                "response_type": detect_response_type(rationale_text),
-                "trace_step": "rationale",
-                "trace_id": trace_id,
-                "session_id": session_id,
-                "metadata": {
-                    "reasoning_length": len(rationale_text),
-                    "contains_delegation": any(word in rationale_text.lower() for word in ['call', 'invoke', 'delegate', 'ask', 'query'])
-                }
-            }
-            agents_found.append(agent_info)
-        
-        # Extract from invocations
-        if "invocation" in orchestration:
-            invocation = orchestration["invocation"]
-            
-            # Knowledge base lookups
-            if "knowledgeBaseLookupOutput" in invocation:
-                kb_output = invocation["knowledgeBaseLookupOutput"]
-                kb_text = ""
-                for ref in kb_output.get("retrievedReferences", []):
-                    kb_text += ref.get("content", {}).get("text", "") + "\n"
-                
-                agent_info = {
-                    "type": "knowledge_base",
-                    "agent_id": f"knowledge-base-{trace_id[:8]}",
-                    "agent_name": "Knowledge Base System",
-                    "content": kb_text.strip(),
-                    "response_type": detect_response_type(kb_text),
-                    "trace_step": "knowledge_lookup",
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "metadata": {
-                        "references_count": len(kb_output.get("retrievedReferences", [])),
-                        "total_content_length": len(kb_text)
-                    }
-                }
-                agents_found.append(agent_info)
-            
-            # Action group invocations (sub-agents, tools, etc.)
-            if "actionGroupInvocationOutput" in invocation:
-                action_output = invocation["actionGroupInvocationOutput"]
-                action_name = action_output.get("actionGroupName", "unknown_action")
-                action_text = action_output.get("text", "")
-                
-                # Create unique agent ID based on action name
-                clean_action_name = re.sub(r'[^a-zA-Z0-9_-]', '-', action_name.lower())
-                
-                agent_info = {
-                    "type": "action_group",
-                    "agent_id": f"agent-{clean_action_name}-{trace_id[:8]}",
-                    "agent_name": f"Agent: {action_name}",
-                    "content": action_text,
-                    "response_type": detect_response_type(action_text),
-                    "trace_step": "action_invocation",
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "metadata": {
-                        "action_group_name": action_name,
-                        "response_length": len(action_text),
-                        "invocation_type": "action_group"
-                    }
-                }
-                agents_found.append(agent_info)
-            
-            # Code interpreter outputs
-            if "codeInterpreterInvocationOutput" in invocation:
-                code_output = invocation["codeInterpreterInvocationOutput"]
-                code_text = str(code_output)
-                
-                agent_info = {
-                    "type": "code_interpreter",
-                    "agent_id": f"code-interpreter-{trace_id[:8]}",
-                    "agent_name": "Code Interpreter",
-                    "content": code_text,
-                    "response_type": "code_execution",
-                    "trace_step": "code_execution",
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "metadata": {
-                        "execution_type": "code_interpreter",
-                        "output_length": len(code_text)
-                    }
-                }
-                agents_found.append(agent_info)
-        
-        # Extract from observations
-        if "observation" in orchestration:
-            observation = orchestration["observation"]
-            
-            # Final response
-            if "finalResponse" in observation:
-                final_resp = observation["finalResponse"]
-                final_text = final_resp.get("text", "")
-                
-                agent_info = {
-                    "type": "final_response",
-                    "agent_id": f"final-response-{trace_id[:8]}",
-                    "agent_name": "Final Response Generator",
-                    "content": final_text,
-                    "response_type": detect_response_type(final_text),
-                    "trace_step": "final_response",
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "metadata": {
-                        "is_final": True,
-                        "response_length": len(final_text)
-                    }
-                }
-                agents_found.append(agent_info)
-            
-            # Reprompt response (when agent asks for clarification)
-            if "repromptResponse" in observation:
-                reprompt = observation["repromptResponse"]
-                reprompt_text = reprompt.get("text", "")
-                
-                agent_info = {
-                    "type": "reprompt",
-                    "agent_id": f"reprompt-{trace_id[:8]}",
-                    "agent_name": "Clarification Agent",
-                    "content": reprompt_text,
-                    "response_type": detect_response_type(reprompt_text),
-                    "trace_step": "reprompt",
-                    "trace_id": trace_id,
-                    "session_id": session_id,
-                    "metadata": {
-                        "requires_clarification": True,
-                        "reprompt_length": len(reprompt_text)
-                    }
-                }
-                agents_found.append(agent_info)
-    
-    return agents_found
+        return chunks_text
+    except Exception as e:
+        safe_print(f"Error extracting chunks from trace: {str(e)}")
+        return ""
 
-def create_agent_spans(agents_info, session_id):
-    """Create properly separated spans for each detected agent"""
-    created_spans = []
-    
-    for agent_info in agents_info:
-        agent_type = agent_info["type"]
-        agent_id = agent_info["agent_id"]
-        agent_name = agent_info["agent_name"]
-        content = agent_info["content"]
-        response_type = agent_info["response_type"]
+def process_trace_event(trace_event, session_id):
+    """Process a single trace event and create appropriate spans"""
+    try:
+        # Get basic trace info
+        agent_id = trace_event.get("agentId", "unknown")
+        agent_name = trace_event.get("agentName", "unknown")
+        collaborator_name = trace_event.get("collaboratorName", "")
+        trace_data = trace_event.get("trace", {})
         
-        # Choose appropriate span type based on agent type
-        if agent_type == "reasoning":
-            span_context = LLMObs.workflow(name=f"reasoning-{agent_id}", session_id=session_id)
-        elif agent_type == "knowledge_base":
-            span_context = LLMObs.retrieval(name=f"kb-{agent_id}", session_id=session_id)
-        elif agent_type == "action_group":
-            # Determine if it's more like an agent or tool based on response type
-            if response_type in ["sql_query", "json_response", "api_call"]:
-                span_context = LLMObs.tool(name=f"tool-{agent_id}", session_id=session_id)
-            else:
-                span_context = LLMObs.agent(name=f"agent-{agent_id}", session_id=session_id)
-        elif agent_type == "code_interpreter":
-            span_context = LLMObs.tool(name=f"code-{agent_id}", session_id=session_id)
-        elif agent_type == "final_response":
-            span_context = LLMObs.llm(name=f"final-{agent_id}", model_name="bedrock-final", model_provider="aws", session_id=session_id)
-        else:
-            span_context = LLMObs.task(name=f"task-{agent_id}", session_id=session_id)
-        
-        with span_context:
-            # Prepare input/output based on response type
-            if response_type == "sql_query":
-                input_data = f"Database query request"
-                output_data = content
-            elif response_type in ["json_response", "api_call"]:
-                input_data = f"API/Service call"
-                output_data = content
-            elif agent_type == "final_response":
-                input_data = [{"role": "system", "content": "Generate final response"}]
-                output_data = [{"role": "assistant", "content": content}]
-            elif agent_type == "knowledge_base":
-                input_data = f"Knowledge retrieval request"
-                output_data = [{"text": content, "source": "knowledge_base"}] if content else []
-            else:
-                input_data = f"Input to {agent_name}"
-                output_data = content
+        # Process PreProcessingTrace
+        if "preProcessingTrace" in trace_data:
+            preprocessing = trace_data["preProcessingTrace"]
+            model_input = preprocessing.get("modelInvocationInput", {})
+            model_output = preprocessing.get("modelInvocationOutput", {})
             
-            # Annotate with rich metadata
+            prompt_text = model_input.get("text", "")
+            rationale = model_output.get("parsedResponse", {}).get("rationale", "")
+            is_valid = model_output.get("parsedResponse", {}).get("isValid", True)
+            
+            with LLMObs.task(name="preprocessing-validation", session_id=session_id):
+                LLMObs.annotate(
+                    input_data=prompt_text,
+                    output_data=f"Valid: {is_valid}, Rationale: {rationale}",
+                    metadata={
+                        "step": "preprocessing",
+                        "is_valid": is_valid,
+                        "foundation_model": model_input.get("foundationModel", ""),
+                        "usage": model_output.get("metadata", {}).get("usage", {})
+                    },
+                    tags={
+                        "trace_type": "preprocessing",
+                        "agent_name": agent_name,
+                        "valid_input": str(is_valid)
+                    }
+                )
+                safe_print(f"✅ Preprocessing: Valid={is_valid}, Rationale={rationale[:50]}...")
+        
+        # Process OrchestrationTrace
+        if "orchestrationTrace" in trace_data:
+            orchestration = trace_data["orchestrationTrace"]
+            
+            # Process Rationale
+            if "rationale" in orchestration:
+                rationale = orchestration["rationale"]
+                rationale_text = rationale.get("text", "")
+                
+                with LLMObs.agent(name=f"reasoning-agent-{agent_name}", session_id=session_id):
+                    LLMObs.annotate(
+                        input_data="Analyzing user input and determining next steps",
+                        output_data=rationale_text,
+                        metadata={
+                            "step": "reasoning",
+                            "reasoning_length": len(rationale_text),
+                            "agent_id": agent_id,
+                            "collaborator": collaborator_name
+                        },
+                        tags={
+                            "trace_type": "rationale",
+                            "agent_name": agent_name,
+                            "has_collaborator": bool(collaborator_name)
+                        }
+                    )
+                    safe_print(f"✅ Rationale: {rationale_text[:100]}...")
+            
+            # Process InvocationInput
+            if "invocationInput" in orchestration:
+                invocation_input = orchestration["invocationInput"]
+                invocation_type = invocation_input.get("invocationType", "")
+                
+                if invocation_type == "ACTION_GROUP":
+                    action_input = invocation_input.get("actionGroupInvocationInput", {})
+                    action_name = action_input.get("actionGroupName", "")
+                    api_path = action_input.get("apiPath", "")
+                    verb = action_input.get("verb", "")
+                    parameters = action_input.get("parameters", [])
+                    
+                    # Format parameters for display
+                    params_str = json.dumps(parameters, indent=2) if parameters else "No parameters"
+                    
+                    with LLMObs.tool(name=f"action-{action_name}", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=f"Calling {verb} {api_path} with parameters: {params_str}",
+                            output_data="Action group invocation initiated",
+                            metadata={
+                                "action_group_name": action_name,
+                                "api_path": api_path,
+                                "verb": verb,
+                                "parameters_count": len(parameters),
+                                "execution_type": action_input.get("executionType", "")
+                            },
+                            tags={
+                                "trace_type": "action_input",
+                                "action_group": action_name,
+                                "api_method": verb
+                            }
+                        )
+                        safe_print(f"✅ Action Input: {action_name} - {verb} {api_path}")
+                
+                elif invocation_type == "KNOWLEDGE_BASE":
+                    kb_input = invocation_input.get("knowledgeBaseLookupInput", {})
+                    kb_id = kb_input.get("knowledgeBaseId", "")
+                    query_text = kb_input.get("text", "")
+                    
+                    with LLMObs.retrieval(name="knowledge-base-query", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=query_text,
+                            output_data="Knowledge base query initiated",
+                            metadata={
+                                "knowledge_base_id": kb_id,
+                                "query_length": len(query_text)
+                            },
+                            tags={
+                                "trace_type": "kb_input",
+                                "knowledge_base_id": kb_id
+                            }
+                        )
+                        safe_print(f"✅ KB Query: {query_text[:100]}...")
+                
+                elif invocation_type == "AGENT_COLLABORATOR":
+                    collab_input = invocation_input.get("agentCollaboratorInvocationInput", {})
+                    collab_name = collab_input.get("agentCollaboratorName", "")
+                    input_text = collab_input.get("input", {}).get("text", "")
+                    
+                    with LLMObs.agent(name=f"collaborator-{collab_name}", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=input_text,
+                            output_data="Collaborator agent invocation initiated",
+                            metadata={
+                                "collaborator_name": collab_name,
+                                "collaborator_arn": collab_input.get("agentCollaboratorAliasArn", ""),
+                                "input_length": len(input_text)
+                            },
+                            tags={
+                                "trace_type": "collaborator_input",
+                                "collaborator": collab_name
+                            }
+                        )
+                        safe_print(f"✅ Collaborator Input: {collab_name} - {input_text[:100]}...")
+            
+            # Process Observation
+            if "observation" in orchestration:
+                observation = orchestration["observation"]
+                obs_type = observation.get("type", "")
+                
+                if obs_type == "ACTION_GROUP":
+                    action_output = observation.get("actionGroupInvocationOutput", {})
+                    response_text = action_output.get("text", "")
+                    
+                    # Try to parse JSON response
+                    try:
+                        if response_text.startswith('"') and response_text.endswith('"'):
+                            response_text = json.loads(response_text)
+                        parsed_response = json.loads(response_text) if isinstance(response_text, str) and response_text.strip().startswith('{') else response_text
+                        formatted_response = json.dumps(parsed_response, indent=2) if isinstance(parsed_response, dict) else str(response_text)
+                    except:
+                        formatted_response = str(response_text)
+                    
+                    with LLMObs.tool(name="action-group-response", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data="Action group execution completed",
+                            output_data=formatted_response,
+                            metadata={
+                                "response_length": len(str(response_text)),
+                                "response_type": "json" if str(response_text).strip().startswith('{') else "text"
+                            },
+                            tags={
+                                "trace_type": "action_output",
+                                "has_response": bool(response_text)
+                            }
+                        )
+                        safe_print(f"✅ Action Output: {str(response_text)[:200]}...")
+                
+                elif obs_type == "KNOWLEDGE_BASE":
+                    kb_output = observation.get("knowledgeBaseLookupOutput", {})
+                    references = kb_output.get("retrievedReferences", [])
+                    
+                    # Extract all reference texts and sources
+                    retrieved_docs = []
+                    for ref in references:
+                        text = ref.get("content", {}).get("text", "")
+                        source = ref.get("location", {}).get("s3Location", {}).get("uri", "")
+                        if text:
+                            retrieved_docs.append({
+                                "text": text,
+                                "source": source,
+                                "id": f"doc_{len(retrieved_docs) + 1}"
+                            })
+                    
+                    all_text = "\n\n".join([doc["text"] for doc in retrieved_docs])
+                    
+                    with LLMObs.retrieval(name="knowledge-base-retrieval", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data="Knowledge base search completed",
+                            output_data=retrieved_docs,
+                            metadata={
+                                "references_count": len(references),
+                                "total_content_length": len(all_text),
+                                "sources": [doc["source"] for doc in retrieved_docs]
+                            },
+                            tags={
+                                "trace_type": "kb_output",
+                                "references_found": str(len(references))
+                            }
+                        )
+                        safe_print(f"✅ KB Output: {len(references)} references, {len(all_text)} chars")
+                
+                elif obs_type == "AGENT_COLLABORATOR":
+                    collab_output = observation.get("agentCollaboratorInvocationOutput", {})
+                    collab_name = collab_output.get("agentCollaboratorName", "")
+                    output_text = collab_output.get("output", {}).get("text", "")
+                    
+                    with LLMObs.agent(name=f"collaborator-response-{collab_name}", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=f"Response from {collab_name}",
+                            output_data=output_text,
+                            metadata={
+                                "collaborator_name": collab_name,
+                                "response_length": len(output_text)
+                            },
+                            tags={
+                                "trace_type": "collaborator_output",
+                                "collaborator": collab_name
+                            }
+                        )
+                        safe_print(f"✅ Collaborator Output: {collab_name} - {output_text[:100]}...")
+                
+                elif obs_type == "FINISH":
+                    final_response = observation.get("finalResponse", {})
+                    final_text = final_response.get("text", "")
+                    
+                    with LLMObs.llm(name="final-response-generator", model_name="bedrock-agent", model_provider="aws", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=[{"role": "system", "content": "Generate final response to user"}],
+                            output_data=[{"role": "assistant", "content": final_text}],
+                            metadata={
+                                "is_final": True,
+                                "response_length": len(final_text)
+                            },
+                            tags={
+                                "trace_type": "final_response",
+                                "is_complete": "true"
+                            }
+                        )
+                        safe_print(f"✅ Final Response: {final_text[:200]}...")
+                
+                elif obs_type == "REPROMPT":
+                    reprompt = observation.get("repromptResponse", {})
+                    reprompt_text = reprompt.get("text", "")
+                    reprompt_source = reprompt.get("source", "")
+                    
+                    with LLMObs.agent(name="clarification-agent", session_id=session_id):
+                        LLMObs.annotate(
+                            input_data=f"Reprompt needed from {reprompt_source}",
+                            output_data=reprompt_text,
+                            metadata={
+                                "reprompt_source": reprompt_source,
+                                "requires_clarification": True
+                            },
+                            tags={
+                                "trace_type": "reprompt",
+                                "source": reprompt_source
+                            }
+                        )
+                        safe_print(f"✅ Reprompt: {reprompt_text[:100]}...")
+        
+        # Process PostProcessingTrace
+        if "postProcessingTrace" in trace_data:
+            postprocessing = trace_data["postProcessingTrace"]
+            model_input = postprocessing.get("modelInvocationInput", {})
+            model_output = postprocessing.get("modelInvocationOutput", {})
+            
+            input_text = model_input.get("text", "")
+            output_text = model_output.get("parsedResponse", {}).get("text", "")
+            
+            with LLMObs.task(name="response-postprocessing", session_id=session_id):
+                LLMObs.annotate(
+                    input_data=input_text,
+                    output_data=output_text,
+                    metadata={
+                        "step": "postprocessing",
+                        "foundation_model": model_input.get("foundationModel", ""),
+                        "usage": model_output.get("metadata", {}).get("usage", {})
+                    },
+                    tags={
+                        "trace_type": "postprocessing",
+                        "agent_name": agent_name
+                    }
+                )
+                safe_print(f"✅ Postprocessing: {output_text[:100]}...")
+        
+        # Process GuardrailTrace
+        if "guardrailTrace" in trace_data:
+            guardrail = trace_data["guardrailTrace"]
+            action = guardrail.get("action", "")
+            
+            with LLMObs.task(name="guardrail-assessment", session_id=session_id):
+                LLMObs.annotate(
+                    input_data="Guardrail safety assessment",
+                    output_data=f"Action taken: {action}",
+                    metadata={
+                        "guardrail_action": action,
+                        "intervention": action == "GUARDRAIL_INTERVENED",
+                        "input_assessments": len(guardrail.get("inputAssessments", [])),
+                        "output_assessments": len(guardrail.get("outputAssessments", []))
+                    },
+                    tags={
+                        "trace_type": "guardrail",
+                        "action": action
+                    }
+                )
+                safe_print(f"✅ Guardrail: {action}")
+        
+        # Process FailureTrace
+        if "failureTrace" in trace_data:
+            failure = trace_data["failureTrace"]
+            failure_reason = failure.get("failureReason", "")
+            
+            with LLMObs.task(name="error-handler", session_id=session_id):
+                LLMObs.annotate(
+                    input_data="Processing failed",
+                    output_data=f"Failure: {failure_reason}",
+                    metadata={
+                        "failed": True,
+                        "failure_reason": failure_reason
+                    },
+                    tags={
+                        "trace_type": "failure",
+                        "error": "true"
+                    }
+                )
+                safe_print(f"❌ Failure: {failure_reason}")
+    
+    except Exception as e:
+        safe_print(f"Error processing trace event: {str(e)}")
+
+def ask_agent_with_bedrock_traces(question, expected=None):
+    """Ask agent and capture all Bedrock traces following AWS documentation structure"""
+    output = ""
+    session_id = f"bedrock-trace_{int(time.time())}"
+    trace_count = 0
+    
+    safe_print(f"\n🎯 Starting BEDROCK TRACE CAPTURE for: {question}")
+    
+    with LLMObs.workflow(name="bedrock-agent-workflow", session_id=session_id):
+        try:
+            # Annotate the workflow with the initial question
             LLMObs.annotate(
-                input_data=input_data,
-                output_data=output_data,
+                input_data=question,
+                output_data="Starting Bedrock agent processing",
                 metadata={
-                    **agent_info["metadata"],
-                    "agent_type": agent_type,
-                    "response_type": response_type,
-                    "trace_step": agent_info["trace_step"],
-                    "content_length": len(content),
-                    "agent_separation_id": agent_id
+                    "workflow_start": True,
+                    "expected_answer": expected
                 },
                 tags={
-                    "agent_name": agent_name.lower().replace(" ", "_"),
-                    "agent_type": agent_type,
-                    "response_type": response_type,
-                    "trace_step": agent_info["trace_step"],
-                    "separated_agent": "true",
-                    "agent_id": agent_id
+                    "workflow": "bedrock_agent",
+                    "language": "hebrew"
                 }
             )
             
-            created_spans.append({
-                "agent_id": agent_id,
-                "agent_name": agent_name,
-                "span_type": agent_type,
-                "response_type": response_type
-            })
-            
-            print(f"✅ Created separated span: {agent_name} ({response_type})")
-    
-    return created_spans
-
-def ask_agent_with_complete_separation(question, expected=None):
-    """Ask agent with complete separation of all sub-agents and response types"""
-    output = ""
-    session_id = f"separated-agents_{int(time.time())}"
-    all_trace_events = []
-    all_agents_detected = []
-    response_types_found = set()
-    
-    print(f"\n🎯 Starting COMPLETE AGENT SEPARATION for: {question}")
-    
-    # Main separation workflow
-    with LLMObs.workflow(name="complete-agent-separation-workflow", session_id=session_id):
-        try:
-            # Step 1: Input processing
-            with LLMObs.task(name="input-preprocessing", session_id=session_id):
-                LLMObs.annotate(
-                    input_data=question,
-                    output_data="Input ready for multi-agent processing",
-                    metadata={
-                        "preprocessing_step": "input_analysis",
-                        "question_length": len(question)
-                    },
-                    tags={
-                        "step_type": "preprocessing",
-                        "workflow_stage": "input"
-                    }
-                )
-            
-            # Step 2: Main agent invocation
-            with LLMObs.agent(name="main-supervisor-agent", session_id=session_id):
-                logging.info(f"Processing with complete separation: {question}")
+            with LLMObs.agent(name=f"bedrock-agent-{AGENT_ID}", session_id=session_id):
+                safe_print(f"Processing question: {question}")
                 
                 response = client.invoke_agent(
                     agentId=AGENT_ID,
                     agentAliasId=AGENT_ALIAS_ID,
                     sessionId=session_id,
                     inputText=question,
-                    enableTrace=True,
-                    streamingConfigurations={
-                        "streamFinalResponse": True,
-                        "applyGuardrailInterval": 50
-                    }
+                    enableTrace=True
                 )
                 
-                print("🔍 Processing ALL trace events for complete agent separation...")
+                safe_print("🔍 Processing trace events...")
                 
-                # Process each event and extract ALL agent information
                 for event_index, event in enumerate(response.get("completion", [])):
                     if "chunk" in event:
                         chunk = event["chunk"]
                         if "bytes" in chunk:
                             text = chunk["bytes"].decode('utf-8')
                             output += text
-                            print(f"📝 Main output chunk {event_index + 1}: {text[:50]}{'...' if len(text) > 50 else ''}")
+                            safe_print(f"📝 Chunk {event_index + 1}: {text[:50]}{'...' if len(text) > 50 else ''}")
                     
                     elif "trace" in event:
-                        trace_event = event["trace"]
-                        all_trace_events.append(trace_event)
-                        
-                        print(f"🔍 Processing trace event {len(all_trace_events)}")
-                        
-                        # Extract ALL agents from this trace event
-                        agents_in_trace = extract_agent_info_from_trace(trace_event)
-                        all_agents_detected.extend(agents_in_trace)
-                        
-                        # Track response types
-                        for agent in agents_in_trace:
-                            response_types_found.add(agent["response_type"])
-                        
-                        # Create separated spans for each agent
-                        if agents_in_trace:
-                            created_spans = create_agent_spans(agents_in_trace, session_id)
-                            print(f"🎯 Created {len(created_spans)} separated agent spans")
+                        trace_count += 1
+                        safe_print(f"🔍 Processing trace event {trace_count}")
+                        process_trace_event(event["trace"], session_id)
                 
-                # Annotate main supervisor
+                # Extract additional chunks using your original method
+                chunks = extract_chunks_from_trace([{"trace": event.get("trace", {})} for event in response.get("completion", []) if "trace" in event])
+                
+                # Annotate the main agent with results
                 LLMObs.annotate(
                     input_data=[{"role": "user", "content": question}],
                     output_data=[{"role": "assistant", "content": output}],
                     metadata={
-                        "supervisor_role": "main_coordinator",
-                        "total_trace_events": len(all_trace_events),
-                        "agents_detected_count": len(all_agents_detected),
-                        "response_types_found": list(response_types_found),
-                        "separation_complete": True
+                        "total_trace_events": trace_count,
+                        "response_length": len(output),
+                        "chunks_extracted": len(chunks) if chunks else 0,
+                        "expected_answer": expected,
+                        "agent_id": AGENT_ID,
+                        "session_id": session_id
                     },
                     tags={
-                        "agent_role": "supervisor",
-                        "separation_enabled": "true",
-                        "agents_count": str(len(all_agents_detected)),
-                        "response_types_count": str(len(response_types_found))
+                        "agent_type": "bedrock_supervisor",
+                        "trace_events_count": str(trace_count),
+                        "has_output": str(bool(output))
                     }
                 )
-            
-            # Step 3: Agent separation summary
-            with LLMObs.task(name="agent-separation-summary", session_id=session_id):
-                unique_agents = {}
-                for agent in all_agents_detected:
-                    agent_key = f"{agent['type']}_{agent['agent_name']}"
-                    if agent_key not in unique_agents:
-                        unique_agents[agent_key] = agent
                 
-                summary_data = {
-                    "total_agents_detected": len(all_agents_detected),
-                    "unique_agents": len(unique_agents),
-                    "response_types": list(response_types_found),
-                    "trace_events_processed": len(all_trace_events),
-                    "agents_by_type": {}
-                }
+                safe_print(f"✅ Processed {trace_count} trace events")
+                safe_print(f"📤 Final output length: {len(output)} chars")
                 
-                # Group agents by type
-                for agent in all_agents_detected:
-                    agent_type = agent["type"]
-                    if agent_type not in summary_data["agents_by_type"]:
-                        summary_data["agents_by_type"][agent_type] = 0
-                    summary_data["agents_by_type"][agent_type] += 1
+                return output.strip() if output else None
                 
-                LLMObs.annotate(
-                    input_data=f"Analyzing {len(all_agents_detected)} detected agents",
-                    output_data=f"Complete separation: {len(unique_agents)} unique agents with {len(response_types_found)} response types",
-                    metadata=summary_data,
-                    tags={
-                        "step_type": "summary",
-                        "separation_complete": "true",
-                        "unique_agents": str(len(unique_agents))
-                    }
-                )
-            
-            print(f"✅ Complete separation: {len(all_agents_detected)} agents, {len(response_types_found)} response types")
-            print(f"📊 Response types found: {', '.join(response_types_found)}")
-            
-            # Annotate main workflow
-            LLMObs.annotate(
-                input_data=question,
-                output_data=output,
-                metadata={
-                    "expected_answer": expected,
-                    "session_id": session_id,
-                    "complete_separation_results": {
-                        "total_agents": len(all_agents_detected),
-                        "unique_agents": len(unique_agents),
-                        "response_types": list(response_types_found),
-                        "trace_events": len(all_trace_events),
-                        "agents_by_type": summary_data["agents_by_type"]
-                    }
-                },
-                tags={
-                    "environment": "development",
-                    "language": "hebrew",
-                    "service": "insurance-agent",
-                    "complete_separation": "enabled",
-                    "total_agents": str(len(all_agents_detected))
-                }
-            )
-            
-            return output.strip() if output else None
-            
         except Exception as e:
-            logging.error(f"Error in complete separation workflow: {e}")
-            print(f"❌ Error occurred: {e}")
-            
+            safe_print(f"❌ Error in workflow: {str(e)}")
             LLMObs.annotate(
                 input_data=question,
                 output_data=f"Error: {str(e)}",
                 metadata={
                     "error": str(e),
-                    "error_type": type(e).__name__,
-                    "separation_failed": True
+                    "error_type": type(e).__name__
                 },
                 tags={
                     "error": "true",
-                    "separation": "failed"
+                    "workflow": "failed"
                 }
             )
-            
             return None
 
 def main():
-    """Main function with complete agent separation"""
+    """Main function with Bedrock trace capture"""
     questions = [
         {
-            "question": "כמה משימות יש לי?", 
+            "question": "כמה משימות יש לי?",
             "expected": "Number of tasks"
         },
         {
@@ -520,12 +543,12 @@ def main():
     ]
     
     print("=" * 80)
-    print("🎯 COMPLETE AGENT SEPARATION - All Response Types Captured")
+    print("🎯 BEDROCK AGENT TRACE CAPTURE - Following AWS Documentation")
     print(f"📍 Application: {ML_APP_NAME}")
     print(f"🌍 Datadog Site: {DATADOG_SITE}")
     print(f"🤖 Agent ID: {AGENT_ID}")
-    print("📊 Captures: SQL queries, JSON, API calls, text responses, etc.")
-    print("🔍 Detection: Automatic with complete separation")
+    print("📊 Captures: All AWS Bedrock trace types with actual content")
+    print("🔍 Following: PreProcessing, Orchestration, PostProcessing, Guardrail, Failure")
     print("=" * 80)
     
     successful_calls = 0
@@ -538,9 +561,8 @@ def main():
         print("-" * 60)
         
         start_time = time.time()
-        result = ask_agent_with_complete_separation(item["question"], item["expected"])
+        result = ask_agent_with_bedrock_traces(item["question"], item["expected"])
         end_time = time.time()
-        
         duration = end_time - start_time
         
         if result:
@@ -551,9 +573,6 @@ def main():
             print(f"❌ FAILED - Duration: {duration:.2f}s")
             print("📤 No response received")
         
-        print(f"📊 Expected: {item['expected']}")
-        
-        # Delay between calls
         if i < total_calls:
             time.sleep(3)
     
@@ -564,24 +583,22 @@ def main():
     print(f"📈 Success rate: {(successful_calls/total_calls)*100:.1f}%")
     print("=" * 80)
     
-    # Force flush to ensure all data is sent to Datadog
     print("\n🔄 Flushing LLM Observability data to Datadog...")
     try:
         LLMObs.flush()
         print("✅ Data successfully flushed to Datadog!")
         print(f"🔗 Check your traces at: https://app.{DATADOG_SITE}/llm/")
-        print("🎯 You should now see COMPLETE SEPARATION:")
-        print("   • Each agent in its own span with unique ID")
-        print("   • SQL queries clearly separated from text responses")
-        print("   • JSON/API responses properly categorized")
-        print("   • Knowledge base lookups as retrieval spans")
-        print("   • Code interpreter outputs as tool spans")
-        print("   • Final responses as LLM spans")
-        print("   • Clear hierarchy: Supervisor → Sub-agents → Tools")
+        print("🎯 You should now see:")
+        print("   • Actual input/output content in each span")
+        print("   • Agent reasoning (rationale) with full text")
+        print("   • Action group calls with parameters & responses")
+        print("   • Knowledge base queries with retrieved documents")
+        print("   • Final responses with complete content")
+        print("   • All trace types following AWS Bedrock structure")
     except Exception as flush_error:
         print(f"❌ Flush error: {flush_error}")
     
-    print("\n🎉 Complete agent separation tracing completed!")
+    print("\n🎉 Bedrock trace capture with content completed!")
 
 if __name__ == "__main__":
     main()
