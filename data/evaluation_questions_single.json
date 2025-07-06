@@ -1,0 +1,8 @@
+[
+  {
+    "question": "כמה משימות יש לי?",
+    "expected": "Number of tasks",
+    "language": "hebrew",
+    "category": "task_management"
+  }
+] 

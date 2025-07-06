@@ -1,0 +1,32 @@
+[
+  {
+    "question": "How many tasks do I have?",
+    "expected": "Number of tasks",
+    "language": "english",
+    "category": "task_management"
+  },
+  {
+    "question": "Which policies are valid?",
+    "expected": "Valid policies information",
+    "language": "english",
+    "category": "policy_validation"
+  },
+  {
+    "question": "How many clients do I have with active home insurance?",
+    "expected": "Active home insurance clients count",
+    "language": "english",
+    "category": "client_analysis"
+  },
+  {
+    "question": "What is the status of policy number 12345?",
+    "expected": "Policy status information",
+    "language": "english",
+    "category": "policy_status"
+  },
+  {
+    "question": "What types of insurance do we have?",
+    "expected": "Insurance types list",
+    "language": "english",
+    "category": "insurance_types"
+  }
+] 

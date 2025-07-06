@@ -1,0 +1,62 @@
+[
+  {
+    "question": "כמה משימות יש לי?",
+    "expected": "Number of tasks",
+    "language": "hebrew",
+    "category": "task_management"
+  },
+  {
+    "question": "אילו פוליסות הן כשרות?",
+    "expected": "Valid policies information",
+    "language": "hebrew",
+    "category": "policy_validation"
+  },
+  {
+    "question": "כמה לקוחות יש לי עם ביטוח דירה אקטיבי?",
+    "expected": "Active home insurance clients count",
+    "language": "hebrew",
+    "category": "client_analysis"
+  },
+  {
+    "question": "מה הסטטוס של הפוליסה מספר 12345?",
+    "expected": "Policy status information",
+    "language": "hebrew",
+    "category": "policy_status"
+  },
+  {
+    "question": "איזה סוגי ביטוח יש לנו?",
+    "expected": "Insurance types list",
+    "language": "hebrew",
+    "category": "insurance_types"
+  },
+  {
+    "question": "כמה תביעות יש לנו השנה?",
+    "expected": "Claims count for current year",
+    "language": "hebrew",
+    "category": "claims_analysis"
+  },
+  {
+    "question": "מה הממוצע של סכומי הפוליסות?",
+    "expected": "Average policy amounts",
+    "language": "hebrew",
+    "category": "financial_analysis"
+  },
+  {
+    "question": "איזה לקוחות יש להם פוליסות שפגות תוקף החודש?",
+    "expected": "Clients with expiring policies this month",
+    "language": "hebrew",
+    "category": "policy_expiration"
+  },
+  {
+    "question": "מה אחוז הלקוחות המרוצים?",
+    "expected": "Customer satisfaction percentage",
+    "language": "hebrew",
+    "category": "customer_satisfaction"
+  },
+  {
+    "question": "איזה סוכנים יש להם הכי הרבה לקוחות?",
+    "expected": "Top agents by client count",
+    "language": "hebrew",
+    "category": "agent_performance"
+  }
+] 

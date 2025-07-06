@@ -75,8 +75,25 @@ pip install -r requirements.txt
 ```
 
 ### 4. Run the Application
+
+#### Option A: Run with Default Evaluation Questions
 ```bash
 python main.py
+```
+
+#### Option B: Interactive Evaluation Runner
+```bash
+python run_evaluation.py
+```
+
+#### Option C: Run Specific Question File
+```bash
+python run_evaluation.py data/evaluation_questions.json
+```
+
+#### Option D: Run with Custom Delay
+```bash
+python run_evaluation.py data/evaluation_questions_single.json 5
 ```
 
 ## 📋 Configuration
